@@ -1,0 +1,81 @@
+# astrbot_plugin_self_msg_guard（自消息守卫 / 防自转）
+
+![logo](logo.png)
+
+解决一类很烦的问题：机器人对着自己刚说的话继续回，越回越多，形成「自转」循环。
+有的情况是本账号的消息被平台回灌成事件，有的情况是**另一个机器人**引用/复读了本机器人的话，
+两个 bot 互相接话，一路转下去。
+
+本插件在事件进入 LLM 之前做判断，比平台自带的 `ignore_bot_self_message` 总开关更精细：
+可以只拦重复内容、只拦高频、放行特定前缀、只在某些会话生效，并且可以选择「只静默自动回复，
+不掐断整条事件」，避免误伤其它插件。
+
+## 三种模式
+
+| 模式 | 行为 | 适用场景 |
+| --- | --- | --- |
+| `self` | 只要是本账号发出的消息，一律拦下 | 平台完全不做自消息过滤、循环最严重时 |
+| `dedup` | 只拦「与机器人刚发出内容高度相似」的消息 | 平台偶尔回灌，日常最平衡 |
+| `rate` | 只拦「本会话机器人短时间发言过量」时的消息 | 群聊活跃、容易聊嗨时 |
+
+## 跨账号回环与静默
+
+- **回环检测**（`dedup_all_senders`，默认开）：非本账号发来的消息里，如果包含机器人
+  在 `dedup_window_sec` 内说过的、长度 ≥ `loop_min_len` 的句子，或整句相似度 ≥ `loop_ratio`，
+  判定为跨账号回环，静默本会话。群里有别的 AI 角色引用宁宁的话时，这条最有用。
+- **引用也算**：被引用的原文不会出现在 `event.message_str` 里，只在消息链的 `Reply`
+  组件中（`sender_id` / `sender_nickname` / `message_str` / `chain`）。插件会直接读
+  `event.message_obj.message` 取出被引用文本，一并参与比对，所以「引用复读」式互相接话
+  同样会被静默；引用的是别人、与本机器人近期发言无关时不会误伤。
+- **静默**（`loop_mute_only`，默认开）：只调用 `should_call_llm(False)`，本会话不再自动回复，
+  但事件照常往下走，记日志、签到之类的插件不受影响。关掉则直接 `stop_event()` 掐断整条事件。
+- **发言过量**（`flood_mute_all_senders`，默认关）：本会话机器人 60 秒内说满 `rate_limit` 条后，
+  连别人的消息也一起静默。比较激进，容易让真人在热闹的时候收不到回复，默认不开。
+- **豁免名单**（`exempt_sender_ids`）：写进去的 QQ 永远不会被静默，建议把真人好友都填上。
+
+## 配置项
+
+| 键 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `enabled` | bool | true | 总开关 |
+| `mode` | string | self | `self` / `dedup` / `rate` |
+| `allow_prefixes` | list | `["!self"]` | 自己消息以此前缀开头则放行 |
+| `session_whitelist` | list | `[]` | 只在这些会话生效（支持统一会话 ID 或其中的数字 ID） |
+| `apply_group` / `apply_private` | bool | true / false | 是否作用于群聊 / 私聊 |
+| `block_llm_for_self_msg` | bool | true | 放行的自己消息是否禁用默认 LLM 请求 |
+| `dedup_window_sec` | int | 120 | 重复/回环比对的时间窗口 |
+| `dedup_min_len` | int | 4 | 参与相似度比对的最短长度 |
+| `dedup_ratio` | float | 0.9 | 自消息重复判定阈值 |
+| `dedup_all_senders` | bool | true | 是否对别人的消息也做回环比对 |
+| `loop_mute_only` | bool | true | 静默时只掐自动回复，不掐事件 |
+| `loop_min_len` | int | 6 | 回环检测的最短匹配长度 |
+| `loop_ratio` | float | 0.55 | 回环检测相似度阈值 |
+| `flood_mute_all_senders` | bool | false | 机器人发言过量时，别人的消息也静默 |
+| `exempt_sender_ids` | list | `[]` | 永不静默的发送者 QQ |
+| `rate_limit` / `rate_window_sec` | int | 5 / 60 | 频率判定：窗口内超过这么多条即视为循环 |
+| `log_blocked` / `verbose_log` | bool | true / false | 拦截日志 |
+
+## 命令
+
+| 命令 | 权限 | 说明 |
+| --- | --- | --- |
+| `/自转守卫` | 管理员 | 查看当前配置与拦截统计 |
+| `/自转守卫日志` | 管理员 | 最近 10 条拦截记录 |
+| `/自转守卫测试 文本` | 管理员 | 只判断不拦截 |
+| `/自转守卫清空` | 管理员 | 清空记录与统计 |
+| `/自转守卫帮助` | 所有人 | 命令说明 |
+
+## 和平台面板开关的关系
+
+面板 `platform_settings.ignore_bot_self_message`（默认 false）是最粗的一层，一开就完全不处理
+自消息。两者可以二选一，也可以叠加：
+
+- 只想解决自消息回灌：面板开关打开即可，本插件可只留跨账号回环检测。
+- 想保留「自己发的指令照常生效」、或者需要防跨账号循环：本插件更合适，模式建议 `rate`。
+- 两者叠加时，本插件的回环检测仍然有效，因为跨账号消息不受面板开关影响。
+
+## 说明
+
+- 只使用内存记录，重启即清空，不落盘、不联网、不收集任何隐私信息。
+- 判定全部基于 `time.time()` 与 `difflib.SequenceMatcher`，无额外依赖。
+- 需要 AstrBot `>= v4.12.0`。

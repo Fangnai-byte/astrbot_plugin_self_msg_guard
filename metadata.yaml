@@ -1,0 +1,40 @@
+# 插件的唯一标识名 (不要改)
+name: astrbot_plugin_self_msg_guard
+
+# 插件展示名
+display_name: Self Msg Guard (自消息守卫 / 防自转)
+
+# 插件的一句话简介
+desc: 拦下机器人自己账号被平台回灌的消息，防止机器人对着自己的话继续回复形成自转循环，支持全拦/去重/限频三种模式、放行前缀与会话白名单
+
+# 插件的详细帮助信息
+help: |
+  有些平台会把机器人自身账号在别的客户端发出的消息也当作消息事件下发，
+  若唤醒判定放行，机器人就会自问自答、循环刷屏。
+  本插件在消息进入 LLM 之前拦下这类“自己发的消息”，比平台总开关更精细：
+  可选拦截模式、可放行某些前缀、可按会话白名单控制范围。
+  管理命令：/自转守卫、/自转守卫日志、/自转守卫测试、/自转守卫清空、/自转守卫帮助。
+
+# (可选) 插件 Logo 文件名（对应插件目录下的 logo.png）
+# 使用 GitHub 绝对链接，避免 Cloud 构建时资源不同步
+logo: "https://raw.githubusercontent.com/Fangnai-byte/astrbot_plugin_self_msg_guard/main/logo.png"
+
+# (可选) 你的 GitHub 仓库地址
+repo: "https://github.com/Fangnai-byte/astrbot_plugin_self_msg_guard"
+
+# 插件版本号
+version: 0.1.0
+
+# 作者名
+author: Fangnai-byte
+
+# 声明支持的平台
+support_platforms:
+  - aiocqhttp
+  - telegram
+  - discord
+  - lark
+  - wecom
+
+# 声明支持的 AstrBot 版本范围
+astrbot_version: ">=v4.12.0"

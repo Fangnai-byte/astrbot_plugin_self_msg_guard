@@ -1,0 +1,155 @@
+{
+  "enabled": {
+    "description": "总开关：开启自消息守卫",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后插件完全不做任何拦截。"
+  },
+  "mode": {
+    "description": "拦截模式",
+    "type": "string",
+    "default": "self",
+    "options": ["self", "dedup", "rate"],
+    "labels": ["self=拦掉本账号发的全部消息", "dedup=只拦与自己刚发出内容重复的", "rate=只拦短时间高频的自己消息"],
+    "hint": "self 最稳（等于平台开关，但支持白名单与放行前缀）；dedup 最精细，但可能漏；rate 只防循环刷屏。"
+  },
+  "allow_prefixes": {
+    "description": "放行前缀（自己发的消息以此开头则不拦）",
+    "type": "list",
+    "default": ["!self"],
+    "hint": "例如填 / 则在手机端用本账号敲的指令照常执行；留空表示不放行任何前缀。"
+  },
+  "session_whitelist": {
+    "description": "生效会话白名单（留空=所有会话生效）",
+    "type": "list",
+    "default": [],
+    "hint": "填 unified_msg_origin（如 aiocqhttp:GroupMessage:748791823）或直接填群号/QQ 号，包含即命中。"
+  },
+  "apply_group": {
+    "description": "对群消息生效",
+    "type": "bool",
+    "default": true
+  },
+  "apply_private": {
+    "description": "对私聊消息生效",
+    "type": "bool",
+    "default": true
+  },
+  "block_llm_for_self_msg": {
+    "description": "放行的自己消息也不送进 LLM",
+    "type": "bool",
+    "default": true,
+    "hint": "避免机器人自问自答；插件指令仍然可用。"
+  },
+  "dedup_window_sec": {
+    "description": "去重窗口（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "只在 dedup 模式生效：与最近这么多秒内发出去的内容比对。"
+  },
+  "dedup_min_len": {
+    "description": "去重最小长度",
+    "type": "int",
+    "default": 4,
+    "hint": "太短的消息（如“好”）不参与比对，避免误伤。"
+  },
+  "dedup_ratio": {
+    "description": "去重相似度阈值",
+    "type": "float",
+    "default": 0.9,
+    "hint": "0.6~1.0，1.0 表示必须完全一致。"
+  },
+  "dedup_all_senders": {
+    "description": "跨账号回环检测（对非本账号消息也比对机器人刚发出的内容）",
+    "type": "bool",
+    "default": true,
+    "hint": "群里有别的机器人引用或复读本机器人时会形成两个 bot 互回，这个开关专门拦这种情况。"
+  },
+  "loop_mute_only": {
+    "description": "回环/高频时只静默自动回复，不掐断整条事件",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后其它插件（记日志、签到等）照常工作，仅本会话不再自动回复。"
+  },
+  "active_stop": {
+    "description": "命中判定时主动刹车（掐掉自动回复并终止事件）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后由本插件自己主动停下，不等平台层兜底；关闭则退回只静默自动回复。"
+  },
+  "loop_min_len": {
+    "description": "回环检测的最短匹配长度",
+    "type": "int",
+    "default": 6,
+    "hint": "机器人说过的话有这么多字被复读即判回环。"
+  },
+  "loop_ratio": {
+    "description": "回环检测相似度阈值",
+    "type": "float",
+    "default": 0.55,
+    "hint": "0.3~1.0。带引用与前后缀的消息建议 0.5 左右。"
+  },
+  "pingpong_rounds": {
+    "description": "互引乒乓判定的来回轮数",
+    "type": "int",
+    "default": 3,
+    "hint": "机器人在窗口内对同一个人主动搭话超过这个次数，对方再来就静默。设 0 关闭。"
+  },
+  "pingpong_window_sec": {
+    "description": "互引乒乓判定的统计窗口（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "只统计这段时间内的搭话轮次。"
+  },
+  "flood_mute_all_senders": {
+    "description": "机器人发言过量时，连别人的消息也一起静默",
+    "type": "bool",
+    "default": false,
+    "hint": "激进选项：本会话机器人 60 秒内说满 rate_limit 条后，后续消息一律不再自动回复。默认关闭，避免真人被误伤。"
+  },
+  "exempt_sender_ids": {
+    "description": "永不静默的发送者 QQ",
+    "type": "list",
+    "default": [],
+    "hint": "把真人好友（包括你自己）写进来，回环检测就绝不会碰他们。"
+  },
+  "peer_bot_ids": {
+    "description": "允许主动刹车处理的对端机器人 QQ",
+    "type": "list",
+    "default": [],
+    "hint": "例如另一个 AstrBot 的账号。只有这里列出的账号（或互引多轮后自动学到的账号）才会被主动掐掉整条消息；真人的引用永远不会被拦。"
+  },
+  "rate_limit": {
+    "description": "单位时间内允许的自己消息条数",
+    "type": "int",
+    "default": 5,
+    "hint": "超过即判定为自转循环并拦截；0 表示不启用频率检测。"
+  },
+  "rate_window_sec": {
+    "description": "频率检测窗口（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "log_blocked": {
+    "description": "拦截时写一条日志",
+    "type": "bool",
+    "default": true
+  },
+  "throttle_enabled": {
+    "description": "会话节流：同一会话限定最小回应间隔",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，同一会话在间隔时间内只会回应一次，其余请求直接停止，用来压制刷屏。"
+  },
+  "throttle_window_sec": {
+    "description": "会话节流间隔（秒）",
+    "type": "int",
+    "default": 5,
+    "hint": "默认 5 秒内同一会话只回应一次；0 表示关闭。"
+  },
+  "verbose_log": {
+    "description": "详细日志（含放行判定）",
+    "type": "bool",
+    "default": false
+  }
+}
