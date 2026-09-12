@@ -574,22 +574,33 @@ class SelfMsgGuardPlugin(Star):
         session = str(getattr(event, "unified_msg_origin", "") or "")
         text = event.message_str or ""
 
-        # ---- 会话节流：同一会话最小间隔内只放行一次请求，防止连珠炮式刷屏
-        window = self.throttle_sec
-        if session and window > 0 and sender_id != self_id and sender_id not in self.exempt_sender_ids:
-            now = time.time()
-            last = self._throttle_at.get(session, 0.0)
-            if now - last < window:
-                self._hard_stop(
-                    event, text, f"同一会话 {window:g} 秒内已有一次回应，本次先停"
-                )
-                return
-            self._throttle_at[session] = now
-
         # ---- 不是本账号发的：只做跨账号回环 / 会话静默检测，绝不误伤人类
         if not self_id or self_id != sender_id:
+            # 先过作用域与豁免名单，再谈节流：豁免的人和不在作用域的会话
+            # 不该被节流牵连，更不该替别人背一次「本次先停」。
             if not self._in_scope(event) or sender_id in self.exempt_sender_ids:
                 return
+
+            # ---- 节流：同一个人在同一个会话里最小间隔内只放行一次请求，防止连珠炮式刷屏
+            # 按「会话 + 发送者」计数：只压同一个人在同一个地方连发，
+            # 别人正常说话不会被连带掐掉，也不会跨群牵连同一个人。
+            window = self.throttle_sec
+            throttle_key = f"{session}|{sender_id}"
+            if session and window > 0:
+                now = time.time()
+                # 顺手清掉过期记录，避免字典随会话数量无限增长
+                if len(self._throttle_at) > 64:
+                    expire = now - max(window, 60.0)
+                    self._throttle_at = {
+                        k: v for k, v in self._throttle_at.items() if v > expire
+                    }
+                last = self._throttle_at.get(throttle_key, 0.0)
+                if now - last < window:
+                    self._hard_stop(
+                        event, text, f"该发送者 {window:g} 秒内已有一次回应，本次先停"
+                    )
+                    return
+                self._throttle_at[throttle_key] = now
             norm = _normalize(text)
             reply_norm, quoted_self = self._extract_reply(event)
             if self.verbose:
@@ -713,7 +724,7 @@ class SelfMsgGuardPlugin(Star):
             f"范围：群 {'开' if _cfg(self.config, 'apply_group', True) else '关'} / "
             f"私聊 {'开' if _cfg(self.config, 'apply_private', True) else '关'}",
             f"放行消息禁用 LLM：{'是' if self.block_llm else '否'}",
-            f"节流：{'每会话 %.1f 秒一次' % self.throttle_sec if self.throttle_sec else '关闭'}",
+            f"节流：{'每人每会话 %.1f 秒一次' % self.throttle_sec if self.throttle_sec else '关闭'}",
             f"已拦截 {self.blocked_total} 条，静默 {self.muted_total} 条，放行 {self.passed_total} 条",
         ]
         yield event.plain_result("\n".join(lines))
