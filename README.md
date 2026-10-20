@@ -52,6 +52,9 @@
 | `loop_ratio` | float | 0.55 | 回环检测相似度阈值 |
 | `flood_mute_all_senders` | bool | false | 机器人发言过量时，别人的消息也静默 |
 | `exempt_sender_ids` | list | `[]` | 永不静默的发送者 QQ |
+| `peer_bot_ids` | list | `[]` | 写明的对端机器人 QQ，它们的引用回环会被主动刹车 |
+| `learned_bots_hard_stop` | bool | false | 自动学到的对端机器人要不要也刹车。默认只静音自动回复，避免误伤真人 |
+| `learned_bot_ttl_sec` | int | 1800 | 自动学到的账号多久失效，误学会自己过期 |
 | `rate_limit` / `rate_window_sec` | int | 5 / 60 | 频率判定：窗口内超过这么多条即视为循环 |
 | `log_blocked` / `verbose_log` | bool | true / false | 拦截日志 |
 

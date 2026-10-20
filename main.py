@@ -165,7 +165,7 @@ class SelfMsgGuardPlugin(Star):
         self._mute_log_at: dict[str, float] = {}
         self._records: deque[str] = deque(maxlen=LOG_MAXLEN)
         self._last_reply_raw: list[str] = []
-        self._learned_bots: set[str] = set()
+        self._learned_bots: dict[str, float] = {}  # sender_id -> 过期时间戳
         self._loop_hits: dict[tuple[str, str], deque[float]] = {}
         self._throttle_at: dict[str, float] = {}
         self.blocked_total = 0
@@ -220,7 +220,39 @@ class SelfMsgGuardPlugin(Star):
         """只有确认是非人类对端机器人，才敢主动掐掉整条消息。"""
         if not sender_id or sender_id in self.exempt_sender_ids:
             return False
-        return sender_id in self.peer_bot_ids or sender_id in self._learned_bots
+        return sender_id in self.peer_bot_ids or self._is_learned_bot(sender_id)
+
+    @property
+    def learned_bot_ttl(self) -> float:
+        """学来的对端机器人多久后失效（秒，0 = 永不过期）。"""
+        return max(0.0, _as_float(_cfg(self.config, "learned_bot_ttl_sec", 1800), 1800.0))
+
+    @property
+    def learned_bots_hard_stop(self) -> bool:
+        """学来的对端机器人要不要主动刹车；默认只静音自动回复，避免误伤真人。"""
+        return _as_bool(_cfg(self.config, "learned_bots_hard_stop", False), False)
+
+    def _learn_bot(self, sender_id: str) -> None:
+        """把某个账号学成对端机器人（带过期时间，误学不会永久生效）。"""
+        if not sender_id:
+            return
+        self._learned_bots[sender_id] = time.time() + self.learned_bot_ttl
+
+    def _is_learned_bot(self, sender_id: str) -> bool:
+        exp = self._learned_bots.get(sender_id)
+        if not exp:
+            return False
+        if exp <= time.time():
+            self._learned_bots.pop(sender_id, None)
+            return False
+        return True
+
+    def _brake(self, event: AstrMessageEvent, text: str, reason: str) -> None:
+        """学来的对端机器人：默认只静音自动回复（不停事件），配置后才主动刹车。"""
+        if self.learned_bots_hard_stop:
+            self._hard_stop(event, text, reason)
+        else:
+            self._quiet(event, text, reason, stop=False)
 
     @property
     def block_llm(self) -> bool:
@@ -519,6 +551,9 @@ class SelfMsgGuardPlugin(Star):
         self._quiet(event, text, reason, stop=True)
 
     def _quiet(self, event, text: str, reason: str, stop: bool) -> None:
+        # ★ 2026-09-27 修正：should_call_llm(True) 才是「禁止默认 LLM」
+        #   （pipeline: `if not event.call_llm: 调用 LLM`）；原来传 False = 反而放行
+
         self.muted_total += 1
         session = str(getattr(event, "unified_msg_origin", "") or "")
         tag = "主动停止" if stop else "静默本会话"
@@ -529,10 +564,10 @@ class SelfMsgGuardPlugin(Star):
                 logger.info(f"[self_guard] {tag}：{reason} :: {text[:60]}")
         self._add_record(event, text, reason)
         if stop:
-            event.should_call_llm(False)
+            event.should_call_llm(True)
             event.stop_event()
         elif self.loop_mute_only:
-            event.should_call_llm(False)
+            event.should_call_llm(True)
         else:
             event.stop_event()
 
@@ -564,11 +599,50 @@ class SelfMsgGuardPlugin(Star):
         self._remember(session, text)
         self._record_out(session)
 
+    # ★ 2026-09-27：平台会把「动作类」事件也回灌进来（如 `offline_file`：对方下载了离线文件），
+    #   私聊里它们同样会被判为「已唤醒」→ 空内容也会触发一次默认 LLM 回复（用户报的
+    #   「她传文件给我、我下载之后她还回一次」就是这个）。这里只**禁止默认 LLM**，
+    #   不 stop_event —— 免得把 pokepro 这类「自己调 LLM」的插件一起掐死。
+    NON_MESSAGE_ALLOW_NOTICE = ("poke",)      # 戳一戳要放行（她要能戳回去）
+
+    def _is_spurious_event(self, event: AstrMessageEvent) -> tuple[bool, str]:
+        """返回 (是否不该触发默认 LLM, 原因)。"""
+        raw = None
+        try:
+            raw = getattr(event.message_obj, "raw_message", None)
+        except Exception:
+            raw = None
+        post = notice = ""
+        if isinstance(raw, dict):
+            post = str(raw.get("post_type") or "")
+            notice = str(raw.get("notice_type") or "")
+        if post and post != "message":
+            if any(k in notice for k in self.NON_MESSAGE_ALLOW_NOTICE):
+                return False, ""
+            return True, "非消息事件（post_type=%s, notice_type=%s）" % (post, notice)
+        try:
+            chain = list(event.message_obj.message or [])
+        except Exception:
+            chain = []
+        kinds = [type(c).__name__ for c in chain]
+        if not (event.message_str or "").strip() and not kinds:
+            return True, "空内容事件（既无文字也无任何消息组件）"
+        return False, ""
+
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def _guard(self, event: AstrMessageEvent):
         """在其它处理器与 LLM 之前，拦下机器人自己发出的消息。"""
         if not self.enabled:
             return
+        if _as_bool(_cfg(self.config, "block_spurious_events", True), True):
+            spurious, why = self._is_spurious_event(event)
+            if spurious:
+                self.spurious_total = getattr(self, "spurious_total", 0) + 1
+                event.should_call_llm(True)          # 只掐默认 LLM
+                if self.log_blocked and self.spurious_total % 10 == 1:
+                    logger.info("[self_guard] 非消息/空内容事件，已禁用默认 LLM：%s" % why)
+                self._add_record(event, "", why)
+                return
         self_id = str(event.get_self_id() or "")
         sender_id = str(event.get_sender_id() or "")
         session = str(getattr(event, "unified_msg_origin", "") or "")
@@ -624,6 +698,8 @@ class SelfMsgGuardPlugin(Star):
                         ],
                     }
                 )
+            # 正文（不是引用）是否在复读机器人原话 —— 真机器人会复读，真人只会引用
+            echo_only = bool(norm) and self._is_loop_back(session, norm, "")
             if self.dedup_all_senders and (norm or reply_norm) and self._is_loop_back(
                 session, norm, reply_norm
             ):
@@ -632,17 +708,20 @@ class SelfMsgGuardPlugin(Star):
                     if reply_norm
                     else "复读/接话命中了机器人刚发出的内容，疑似跨账号回环"
                 )
-                # 明确引用了机器人的原话才考虑主动刹车；只靠相似度命中时保守处理，
-                # 免得普通人顺口说句同样的话就被整条掐掉。
-                # 真人引用机器人消息是再正常不过的行为，所以这里绝不拦真人：
-                # 要么对方在 peer_bot_ids 里（已确认的对端机器人），要么同一个人
-                # 短时间内反复引用机器人原话、被自动学成机器人之后才动手。
-                if reply_norm and self._is_peer_bot(sender_id):
+                # 真人引用机器人消息太正常了（聊天时经常引用来接话），所以分三档：
+                # 1) peer_bot_ids 里写明的对端机器人 → 主动刹车；
+                # 2) 学来的对端机器人 → 默认只静音自动回复，配置后才会刹车；
+                # 3) 「学」要求正文本身在复读机器人原话，光引用不算。
+                if reply_norm and sender_id in self.peer_bot_ids:
                     self._hard_stop(event, text or reply_norm, reason)
-                elif reply_norm and self._is_loop_bot(session, sender_id):
-                    self._learned_bots.add(sender_id)
-                    self._hard_stop(
-                        event, text or reply_norm, reason + "（同一账号反复引用，已判为对端机器人）"
+                elif reply_norm and self._is_learned_bot(sender_id):
+                    self._brake(event, text or reply_norm, reason + "（学到的对端机器人）")
+                elif reply_norm and echo_only and self._is_loop_bot(session, sender_id):
+                    self._learn_bot(sender_id)
+                    self._brake(
+                        event,
+                        text or reply_norm,
+                        reason + "（正文在复读机器人原话，学为对端机器人）",
                     )
                 else:
                     self._add_record(event, text or reply_norm, reason + "（疑似真人，放行）")
@@ -668,14 +747,18 @@ class SelfMsgGuardPlugin(Star):
             if (
                 self.dedup_all_senders
                 and mentions_self
+                and echo_only
                 and self._is_pingpong(session, sender_id)
             ):
-                # 来回多轮还能 @ 回来的，基本不是人类手速能打出的节奏，
-                # 学到名单里，之后它的引用回环就可以直接主动刹车了。
-                if not self._is_peer_bot(sender_id):
-                    self._learned_bots.add(sender_id)
-                self._mute(
-                    event, text or reply_norm, "与同一个人来回多轮、互相引用成环，先静默一会儿"
+                # 来回多轮、正文还在复读机器人原话，才当对端机器人；真人 @ 回来不算。
+                # pingpong 的计数是「机器人自己 @ 过对方」喂出来的，光凭这一点就把人
+                # 学成机器人，会把正常聊天的人永久静音（2026-10-20 实测踩过）。
+                if sender_id not in self.peer_bot_ids:
+                    self._learn_bot(sender_id)
+                self._brake(
+                    event,
+                    text or reply_norm,
+                    "与同一个人来回多轮、且正文在复读机器人原话，先静音一会儿",
                 )
                 return
             if self.flood_mute_all_senders and self._is_flood_out(session):
@@ -686,7 +769,7 @@ class SelfMsgGuardPlugin(Star):
         prefix = self._is_allowed_prefix(text)
         if prefix:
             if self.block_llm:
-                event.should_call_llm(False)
+                event.should_call_llm(True)
             self.passed_total += 1
             if self.verbose:
                 logger.info(f"[self_guard] 放行（前缀 {prefix}）：{text[:40]}")
@@ -706,7 +789,7 @@ class SelfMsgGuardPlugin(Star):
 
         self.passed_total += 1
         if self.block_llm:
-            event.should_call_llm(False)
+            event.should_call_llm(True)
         if self.verbose:
             logger.info(f"[self_guard] 放行但禁用 LLM：{text[:40]}")
 
