@@ -259,6 +259,11 @@ class SelfMsgGuardPlugin(Star):
         return _as_bool(_cfg(self.config, "block_llm_for_self_msg", True), True)
 
     @property
+    def pingpong_ignore_echo(self) -> bool:
+        """群里"引用回话"的乒乓是否也算（不必正文复读）。见 2026-10-22 的注释。"""
+        return _as_bool(_cfg(self.config, "pingpong_ignore_echo", False), False)
+
+    @property
     def log_blocked(self) -> bool:
         return _as_bool(_cfg(self.config, "log_blocked", True), True)
 
@@ -412,13 +417,29 @@ class SelfMsgGuardPlugin(Star):
         now = time.time()
         return sum(1 for ts in bucket if now - ts <= window) >= limit
 
+    def _debug_path(self) -> str:
+        """调试文件的位置：data/plugin_data/astrbot_plugin_self_msg_guard/。
+
+        审核要求持久化数据必须落在这个目录下；以前是往 data/ 根目录写，
+        既不合规，内容里又带着会话文本和发送者 QQ。
+        """
+        try:
+            from astrbot.core.star.star_tools import StarTools
+
+            base = str(StarTools.get_data_dir("astrbot_plugin_self_msg_guard"))
+        except Exception:
+            here = os.path.dirname(os.path.abspath(__file__))
+            base = os.path.join(os.path.dirname(os.path.dirname(here)),
+                                "plugin_data", "astrbot_plugin_self_msg_guard")
+        os.makedirs(base, exist_ok=True)
+        return os.path.join(base, "self_guard_debug.jsonl")
+
     def _debug(self, payload: dict) -> None:
         """把判定现场写成独立 jsonl，避免被主日志轮转吃掉。"""
         if not self.verbose:
             return
         try:
-            root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            path = os.path.join(root, "self_guard_debug.jsonl")
+            path = self._debug_path()
             if os.path.exists(path) and os.path.getsize(path) > 262144:
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write("")
@@ -744,10 +765,23 @@ class SelfMsgGuardPlugin(Star):
                             break
                 except Exception:
                     pass
+            # ★ 2026-10-22：**群里"引用回话"的乒乓也算循环**，不再要求正文复读。
+            #   实况（群 748791823）：小杏仁 每条都在 `[Quote(绫地宁宁…)]`，
+            #   宁宁回 → 她又引用 → 宁宁又回，内容每次都不重复 → `echo_only=False`
+            #   → 旧判据永远不刹车，只能靠人发 `/stop`。
+            #   口径：**仅群聊**、且 `pingpong_ignore_echo=true` 时，只要「机器人 @ 过对方 N 轮
+            #   ＋ 对方这次又在引用/@ 机器人」就刹车；私聊不放（正常聊天就是来回）。
+            #   ⚠️ 2026-10-23 修：这里原来写了 `_is_private_chat(event)`——那是 dsh_relay 里的函数，
+            #   本插件没有，直接 NameError 把整个 _guard 打挂（日志里 12:53:46 抓到）。用 event 自己的方法。
+            try:
+                _pp_private = bool(event.is_private_chat())
+            except Exception:
+                _pp_private = False
+            _pp_ignore_echo = bool(self.pingpong_ignore_echo) and not _pp_private
             if (
                 self.dedup_all_senders
                 and mentions_self
-                and echo_only
+                and (echo_only or _pp_ignore_echo)
                 and self._is_pingpong(session, sender_id)
             ):
                 # 来回多轮、正文还在复读机器人原话，才当对端机器人；真人 @ 回来不算。

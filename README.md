@@ -79,12 +79,16 @@
 
 ## 说明
 
-- 只使用内存记录，重启即清空，不落盘、不联网、不收集任何隐私信息。
+- 判定用的记录只在内存里，重启即清空；插件不联网，也不主动收集隐私信息。
+- 唯一会写盘的是调试开关：`verbose_log` 打开时，判定现场会写到 `data/plugin_data/astrbot_plugin_self_msg_guard/self_guard_debug.jsonl`，内容包含会话文本与发送者号码，排查完请关掉这个开关并删掉文件。
 - 判定全部基于 `time.time()` 与 `difflib.SequenceMatcher`，无额外依赖。
 - 需要 AstrBot `>= v4.12.0`。
 
 ## 更新日志
 
+- **v0.1.3**
+  - 修复：`verbose_log` 打开时调试文件写到 AstrBot 的 `data/` 根目录，不符合「持久化数据放 `data/plugin_data/<plugin_name>/`」的规范。现在写到 `data/plugin_data/astrbot_plugin_self_msg_guard/self_guard_debug.jsonl`。
+  - 文档：README 原先写「不落盘、不收集隐私信息」，与行为不符，已改成如实描述。
 - **v0.1.1**
   - 修复：节流原先排在作用域与豁免判断之前，导致豁免用户、未启用范围的会话
     也会被「本次先停」牵连；现改为先过范围与豁免，再判断节流。

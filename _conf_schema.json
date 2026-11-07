@@ -111,6 +111,12 @@
         "default": 3,
         "hint": "机器人在窗口内对同一个人主动搭话超过这个次数，对方再来就静默。设 0 关闭。"
     },
+    "pingpong_ignore_echo": {
+        "description": "群里「引用回话」的乒乓也算循环（不要求正文复读）",
+        "type": "bool",
+        "default": false,
+        "hint": "开：群聊里对方每轮都在引用/@ 机器人、且来回已够 N 轮，就静默一会儿。私聊不受影响（正常聊天就是来回）。"
+    },
     "pingpong_window_sec": {
         "description": "互引乒乓判定的统计窗口（秒）",
         "type": "int",
