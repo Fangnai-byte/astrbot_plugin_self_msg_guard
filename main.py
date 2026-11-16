@@ -167,6 +167,9 @@ class SelfMsgGuardPlugin(Star):
         self._last_reply_raw: list[str] = []
         self._learned_bots: dict[str, float] = {}  # sender_id -> 过期时间戳
         self._loop_hits: dict[tuple[str, str], deque[float]] = {}
+        self._quote_hits: dict[tuple[str, str], deque[float]] = {}   # 引用/@ 了机器人的轮次
+        self._peer_last_msg: dict[tuple[str, str], float] = {}      # 对方最后一次说话的时间
+        self._rt: dict[tuple[str, str], deque[float]] = {}          # 往返耗时（秒）
         self._throttle_at: dict[str, float] = {}
         self.blocked_total = 0
         self.passed_total = 0
@@ -323,13 +326,29 @@ class SelfMsgGuardPlugin(Star):
         self._sent.append((time.time(), session, norm))
 
     def _remember_peers(self, session: str, peers: set[str]) -> None:
-        """记录机器人主动搭话的对象，用于识破「你一句我一句」的互引乒乓。"""
+        """记录机器人刚回给了谁，以及这次「对方说完 → 机器人回完」花了多久。
+
+        ★ 2026-11-17：节律要看的是**往返耗时**（对方一句话、它 10~20 秒就回），
+        而不是机器人自己两次发言的间隔——中间还夹着对方的发言和生成时间，
+        按后者算会把正常的 20~40 秒回合一概排除掉。
+        """
         if not peers:
             return
         now = time.time()
         for peer in peers:
             bucket = self._peer_ts.setdefault((session, peer), deque(maxlen=64))
             bucket.append(now)
+            last = self._peer_last_msg.get((session, peer), 0.0)
+            if last and 0 < now - last < 600:
+                rt = self._rt.setdefault((session, peer), deque(maxlen=64))
+                rt.append(now - last)
+
+    def _note_peer_msg(self, session: str, sender_id: str) -> None:
+        """记下「这个人在这个会话刚说了一句」，供下次机器人回完时算往返耗时。"""
+        if not hasattr(self, "_peer_last_msg"):
+            self._peer_last_msg = {}
+        if session and sender_id:
+            self._peer_last_msg[(session, sender_id)] = time.time()
 
     def _is_pingpong(self, session: str, sender_id: str) -> bool:
         """同一会话里，机器人与同一个人已来回多轮时判为互引乒乓。
@@ -347,7 +366,20 @@ class SelfMsgGuardPlugin(Star):
         now = time.time()
         while bucket and now - bucket[0] > window:
             bucket.popleft()
-        return len(bucket) >= rounds
+        if len(bucket) < rounds:
+            return False
+        # ★ 2026-11-17：再加一道节律条件。两台机器对刷时，对方几乎总在 10~20 秒内
+        #   回过来；真人哪怕连着聊，也很难连续几轮都这么快。所以要求最近几轮的
+        #   间隔中位数不超过 pingpong_gap_sec（默认 30 秒），才判成乒乓。
+        gap_limit = _as_float(_cfg(self.config, "pingpong_gap_sec", 25), 25.0)
+        if gap_limit <= 0:
+            return True
+        rt = list(self._rt.get((session, sender_id), ()))[-rounds:]
+        if len(rt) < max(2, rounds - 1):
+            return False          # 往返样本不够，先不判
+        rt.sort()
+        median = rt[len(rt) // 2]
+        return median <= gap_limit
 
     def _is_loop_bot(self, session: str, sender_id: str) -> bool:
         """同一账号短时间内反复引用机器人原话，基本可以认定是对端机器人。
@@ -360,6 +392,31 @@ class SelfMsgGuardPlugin(Star):
             return False
         window = max(1, _as_int(_cfg(self.config, "pingpong_window_sec", 120), 120))
         bucket = self._loop_hits.setdefault((session, sender_id), deque(maxlen=64))
+        now = time.time()
+        while bucket and now - bucket[0] > window:
+            bucket.popleft()
+        bucket.append(now)
+        return len(bucket) >= rounds
+
+    def _is_quote_bot(self, session: str, sender_id: str) -> bool:
+        """同一账号反复「引用/@ 机器人但说自己的话」，也算对端机器人。
+
+        ★ 2026-11-14 补的口子：上面那条 `_is_loop_back` 分支一旦命中（引用的是
+        机器人原话），四档判断里第 3 档要求「正文也在复读原话」。于是「每轮引用
+        宁宁 + @ 宁宁 + 说自己的新内容」这种最典型的互引回环，永远落到第 4 档
+        「疑似真人，放行」并 return，后面那段 pingpong 判据根本走不到。
+        实测：模拟 6 轮、间隔 8 秒，默认配置和 pingpong_ignore_echo=true 都不停。
+
+        现在单独计数：同一发送者在窗口内第 N 次「引用或 @ 机器人」就学成对端机器人，
+        默认只静音自动回复（不 stop 事件）；learned_bots_hard_stop=true 时才真停。
+        """
+        rounds = _as_int(_cfg(self.config, "quote_loop_rounds", 5), 5)
+        if rounds <= 0 or not sender_id:
+            return False
+        window = max(1, _as_int(_cfg(self.config, "pingpong_window_sec", 120), 120))
+        if not hasattr(self, "_quote_hits"):     # 热重载留下的老实例没有这个字段
+            self._quote_hits = {}
+        bucket = self._quote_hits.setdefault((session, sender_id), deque(maxlen=64))
         now = time.time()
         while bucket and now - bucket[0] > window:
             bucket.popleft()
@@ -385,16 +442,31 @@ class SelfMsgGuardPlugin(Star):
         return False
 
     def _is_flood(self, session: str) -> bool:
+        """只判断，不计数。
+
+        ★ 2026-11-14：以前这里顺手 append，于是 `judge()` 带副作用——
+        `/自转守卫测试` 连测几次就会把 `_seen_self` 填满，随后真实的自消息
+        被误判成"高频自转"。计数挪到 `_record_self_hit()`，只在 _guard 里调。
+        """
         limit = _as_int(_cfg(self.config, "rate_limit", 5), 5)
         if limit <= 0:
             return False
         window = max(1, _as_int(_cfg(self.config, "rate_window_sec", 60), 60))
         now = time.time()
-        bucket = self._seen_self.setdefault(session, deque(maxlen=limit + 5))
+        bucket = self._seen_self.get(session)
+        if not bucket:
+            return False
         while bucket and now - bucket[0] > window:
             bucket.popleft()
-        bucket.append(now)
         return len(bucket) >= limit
+
+    def _record_self_hit(self, session: str) -> None:
+        """记一次「自己账号在这个会话发了话」，供 _is_flood 统计。"""
+        limit = _as_int(_cfg(self.config, "rate_limit", 5), 5)
+        if limit <= 0:
+            return
+        bucket = self._seen_self.setdefault(session, deque(maxlen=limit + 5))
+        bucket.append(time.time())
 
     def _record_out(self, session: str) -> None:
         limit = max(1, _as_int(_cfg(self.config, "rate_limit", 5), 5))
@@ -696,6 +768,7 @@ class SelfMsgGuardPlugin(Star):
                     )
                     return
                 self._throttle_at[throttle_key] = now
+            self._note_peer_msg(session, sender_id)
             norm = _normalize(text)
             reply_norm, quoted_self = self._extract_reply(event)
             if self.verbose:
@@ -735,7 +808,9 @@ class SelfMsgGuardPlugin(Star):
                 # 3) 「学」要求正文本身在复读机器人原话，光引用不算。
                 if reply_norm and sender_id in self.peer_bot_ids:
                     self._hard_stop(event, text or reply_norm, reason)
-                elif reply_norm and self._is_learned_bot(sender_id):
+                elif self._is_learned_bot(sender_id):
+                    # 不看有没有引用：学到的对端机器人，无论是引用还是跟着复读同一句，
+                    # 都继续静音（原来只在 reply_norm 时判，复读同一句口头禅就漏掉了）
                     self._brake(event, text or reply_norm, reason + "（学到的对端机器人）")
                 elif reply_norm and echo_only and self._is_loop_bot(session, sender_id):
                     self._learn_bot(sender_id)
@@ -743,6 +818,14 @@ class SelfMsgGuardPlugin(Star):
                         event,
                         text or reply_norm,
                         reason + "（正文在复读机器人原话，学为对端机器人）",
+                    )
+                elif self._is_quote_bot(session, sender_id):
+                    # 反复「引用/@ 机器人 + 说自己的新内容」：不是复读，但明显是互引回环
+                    self._learn_bot(sender_id)
+                    self._brake(
+                        event,
+                        text or reply_norm,
+                        reason + "（反复引用/@，学为对端机器人）",
                     )
                 else:
                     self._add_record(event, text or reply_norm, reason + "（疑似真人，放行）")
@@ -778,6 +861,11 @@ class SelfMsgGuardPlugin(Star):
             except Exception:
                 _pp_private = False
             _pp_ignore_echo = bool(self.pingpong_ignore_echo) and not _pp_private
+            # ★ 2026-11-17：已经被判定/学成对端机器人的号，只要还在 @/引用机器人，
+            #   就继续静音，不必每次都重新攒够轮次（原来攒不够就放行，表现为忽停忽不停）。
+            if mentions_self and self._is_learned_bot(sender_id):
+                self._brake(event, text or reply_norm, "已学为对端机器人，继续静音")
+                return
             if (
                 self.dedup_all_senders
                 and mentions_self
@@ -812,13 +900,14 @@ class SelfMsgGuardPlugin(Star):
         if not self._in_scope(event):
             return
 
+        self._record_self_hit(session)
         blocked, reason = self.judge(session, text)
         if blocked:
             self.blocked_total += 1
-            if self.log_blocked:
-                logger.info(f"[self_guard] 拦截自己发的消息：{reason} :: {text[:60]}")
-            self._add_record(event, text, reason)
-            event.stop_event()
+            # ★ 2026-11-14：以前这里无条件 stop_event()，`active_stop` 只对 flood 那条
+            #   路径生效，配置写了等于没写。统一走 _quiet：stop 由 active_stop 决定，
+            #   不 stop 时仍会 should_call_llm(True) 掐掉自动回复。
+            self._quiet(event, text, reason, stop=self.active_stop)
             return
 
         self.passed_total += 1
@@ -882,6 +971,12 @@ class SelfMsgGuardPlugin(Star):
         self._seen_self.clear()
         self._out_ts.clear()
         self._mute_log_at.clear()
+        # 这几个以前没清：节流时间、学到的对端机器人、回环计数、已发送记录
+        self._throttle_at.clear()
+        self._learned_bots.clear()
+        self._loop_hits.clear()
+        self._peer_ts.clear()
+        self._sent.clear()
         self.blocked_total = 0
         self.passed_total = 0
         self.muted_total = 0
